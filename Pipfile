@@ -5,6 +5,10 @@ name = "pypi"
 
 [packages]
 groq = "*"
+speechrecognition = "*"
+pydub = "*"
+flask = "*"
+flask-cors = "*"
 
 [dev-packages]
 
