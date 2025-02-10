@@ -14,7 +14,7 @@ query = "Is there any problem here?"
 model = "llama-3.2-90b-vision-preview"
 
 def analyze_image_with_query(query, model, image_file):
-    client=Groq()  
+    client=Groq()   
     messages=[
         {
             "role": "user",

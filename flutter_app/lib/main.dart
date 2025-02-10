@@ -1,7 +1,11 @@
+import 'dart:async';
+import 'dart:convert'; // For jsonEncode and base64 encoding.
 import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 void main() => runApp(MyApp());
 
@@ -24,18 +28,29 @@ class ImagePickerScreen extends StatefulWidget {
 }
 
 class _ImagePickerScreenState extends State<ImagePickerScreen> {
-  // This will hold the image data (in bytes) for both mobile and web.
+  // For image handling.
   Uint8List? _imageBytes;
-  // Optional: Keep track of the image name for sending it to the backend.
   String? _imageName;
   final ImagePicker _picker = ImagePicker();
 
-  /// Pick an image from the gallery and read its bytes.
+  // For speech-to-text.
+  late stt.SpeechToText _speech;
+  bool _isListening = false;
+  String _recognizedText = ""; // Final text displayed after stopping.
+  String _tempText = ""; // Temporary storage while listening.
+  Timer? _listeningTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _speech = stt.SpeechToText();
+  }
+
+  /// Pick an image from the gallery.
   Future<void> _pickImage() async {
     try {
       final pickedFile = await _picker.pickImage(source: ImageSource.gallery);
       if (pickedFile != null) {
-        // Read the image as bytes.
         final bytes = await pickedFile.readAsBytes();
         setState(() {
           _imageBytes = bytes;
@@ -49,8 +64,56 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
     }
   }
 
-  /// Send the image bytes to your Flask backend for analysis.
-  Future<void> _analyzeImage() async {
+  /// Toggle listening. When started, listen for up to 10 seconds or until tapped again.
+  void _toggleListening() async {
+    if (!_isListening) {
+      bool available = await _speech.initialize(
+        onStatus: (status) => print("Speech status: $status"),
+        onError: (errorNotification) =>
+            print("Speech error: $errorNotification"),
+      );
+      if (available) {
+        setState(() {
+          _isListening = true;
+          _tempText = "";
+          _recognizedText = "";
+        });
+        _speech.listen(
+          onResult: (result) {
+            // Update temporary text while listening.
+            _tempText = result.recognizedWords;
+          },
+          listenMode: stt.ListenMode.confirmation,
+          partialResults: true,
+          cancelOnError: false,
+        );
+        // Auto-stop after 10 seconds.
+        _listeningTimer = Timer(Duration(seconds: 10), () {
+          if (_isListening) {
+            _stopListening();
+          }
+        });
+      }
+    } else {
+      _stopListening();
+    }
+  }
+
+  /// Stops listening and updates the displayed transcribed text.
+  void _stopListening() {
+    _speech.stop();
+    if (_listeningTimer != null) {
+      _listeningTimer!.cancel();
+      _listeningTimer = null;
+    }
+    setState(() {
+      _isListening = false;
+      _recognizedText = _tempText;
+    });
+  }
+
+  /// Send the image and the transcribed query directly to the Groq API.
+  Future<void> _analyzeImageDirectly() async {
     if (_imageBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Please pick an image first.")),
@@ -58,35 +121,64 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
       return;
     }
 
-    // Replace with the URL of your Flask backend endpoint.
-    final url = Uri.parse('http://localhost:5000/analyze');
+    // Use the transcribed text as the query; if empty, use a default query.
+    String queryText = _recognizedText.isNotEmpty
+        ? _recognizedText
+        : "Is there any problem here?";
+    String model = "llama-3.2-90b-vision-preview";
+
+    // Encode the image bytes to base64.
+    String base64Image = base64Encode(_imageBytes!);
+    // Construct the data URI string; adjust the MIME type if needed.
+    String imageDataUri = "data:image/jpeg;base64,$base64Image";
+
+    // Build the JSON payload.
+    Map<String, dynamic> payload = {
+      "model": model,
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": queryText,
+            },
+            {
+              "type": "image_url",
+              "image_url": {"url": imageDataUri},
+            },
+          ],
+        }
+      ]
+    };
+
+    // Groq API endpoint.
+    final url = Uri.parse("https://api.groq.com/openai/v1/chat/completions");
+    const String groqApiKey =
+        "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";
 
     try {
-      var request = http.MultipartRequest('POST', url);
-      // Attach the image bytes. The field name ('image') must match your backend’s expectations.
-      request.files.add(
-        http.MultipartFile.fromBytes(
-          'image',
-          _imageBytes!,
-          filename: _imageName ?? 'image.jpg',
-        ),
+      final response = await http.post(
+        url,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer $groqApiKey",
+        },
+        body: jsonEncode(payload),
       );
-      var system_prompt =
-          "You have to act as a professional doctor, I know you are not but this is for learning purpose. What's in this image?. Do you find anything wrong with it medically? If you make a differential, suggest some remedies for them. Do not add any numbers or special characters in your response. Your response should be in one long paragraph. Also always answer as if you are answering to a real person. Do not say 'In the image I see' but say 'With what I see, I think you have ....'. Do not respond as an AI model in markdown, your answer should mimic that of an actual doctor not an AI bot, Keep your answer concise (max 2 sentences). No preamble, start your answer right away please.";
-      request.fields['query'] = "$system_prompt Is there any problem here and what I must do to prevent or avoid this?";
-
-      var response = await request.send();
-
       if (response.statusCode == 200) {
-        var responseData = await response.stream.bytesToString();
-        print('Analysis success: $responseData');
+        final responseJson = jsonDecode(response.body);
+        // Assuming the API returns a structure similar to:
+        // { "choices": [ { "message": { "content": "<result>" } } ] }
+        final result = responseJson["choices"][0]["message"]["content"];
+        print("Analysis success: $result");
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Image analysis successful.")),
+          SnackBar(content: Text("Analysis success: $result")),
         );
       } else {
-        print('Analysis failed with status: ${response.statusCode}');
+        print("Analysis failed with status: ${response.statusCode}");
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Analysis failed.")),
+          SnackBar(content: Text("Analysis failed: ${response.statusCode}")),
         );
       }
     } catch (e) {
@@ -103,9 +195,9 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
       appBar: AppBar(
         title: Text('Docbot App'),
       ),
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16.0),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: <Widget>[
@@ -114,7 +206,7 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
                 child: Text('Pick Image'),
               ),
               SizedBox(height: 20),
-              // Display the image using Image.memory.
+              // Display the picked image.
               _imageBytes != null
                   ? Image.memory(
                       _imageBytes!,
@@ -123,7 +215,24 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
                   : Container(),
               SizedBox(height: 20),
               ElevatedButton(
-                onPressed: _analyzeImage,
+                onPressed: _toggleListening,
+                child: Text(_isListening ? 'Stop' : 'Record Query'),
+              ),
+              SizedBox(height: 10),
+              // Display transcribed text only after listening stops.
+              (!_isListening && _recognizedText.isNotEmpty)
+                  ? TextFormField(
+                      initialValue: _recognizedText,
+                      decoration: InputDecoration(
+                        labelText: "Enter Query",
+                        border: OutlineInputBorder(),
+                      ),
+                      style: TextStyle(fontSize: 16),
+                    )
+                  : Container(),
+              SizedBox(height: 20),
+              ElevatedButton(
+                onPressed: _analyzeImageDirectly,
                 child: Text('Analyse'),
               ),
             ],
